@@ -1,0 +1,9 @@
+[package]
+name = "barn"
+version = "0.0.0"
+authors = ["Sebastian Köln <sebk@rynx.org>"]
+description = "Placeholder for a copy-on-write storage"
+license = "MIT
+repository = "https://github.com/s3bk/barn.git"
+
+[dependencies]
