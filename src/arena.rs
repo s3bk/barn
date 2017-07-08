@@ -162,6 +162,19 @@ pub struct Box<'a, T: 'a> {
     inner:  *mut Data<T>,
     arena:  &'a Arena
 }
+impl<'a, T: 'a> Box<'a, T> {
+    fn inner(&self) -> &Data<T> {
+        unsafe { &(*self.inner) }
+    }
+    pub fn into_rc(self) -> Rc<'a, T> {
+        // set refcount to one
+        self.inner().rc.store(1, Release);
+        Rc {
+            inner: self.inner,
+            arena: self.arena
+        }
+    }
+}
 impl<'a, T: 'a> Drop for Box<'a, T> {
     #[inline(always)]
     fn drop(&mut self) {
@@ -172,7 +185,7 @@ impl<'a, T> Deref for Box<'a, T> {
     type Target = T;
     #[inline(always)]
     fn deref(&self) -> &T {
-        unsafe { &(*self.inner).data }
+        &self.inner().data
     }
 }
 impl<'a, T> DerefMut for Box<'a, T> {
@@ -321,5 +334,12 @@ impl<'a, T: 'a> RcCell<'a, T> {
                 (Some(rc.clone().to_shared()), Some(rc))
             }
         })
+    }
+    
+    pub fn swap(&self, rc: Rc<'a, T>) -> Option<Rc<'a, T>> {
+        self.cell.swap(|c| (
+            Some(rc.to_shared()),                       // value to be stored
+            c.map(|p| Rc::from_shared(self.arena, p))   // value returned
+        ))
     }
 }

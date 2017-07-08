@@ -5,7 +5,7 @@ store data aligned correctly
 */
 use memmap::{Mmap, Protection};
 use std::{mem, ptr, slice};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use arena::{Arena, Cell, RcCell};
 
@@ -62,6 +62,7 @@ pub enum Offset {
     Far(u64)     // 64 bit
 }    
 
+#[repr(packed)]
 struct FileHeader<T> {
     magic:      [u8; 4], // b"barn"
     version:    u32,
@@ -69,50 +70,97 @@ struct FileHeader<T> {
     arena:      Arena
 }
 
-pub struct Barn {
+pub struct Barn<T> {
     mmap:   Mmap,
+    header: *const FileHeader<T>,
+    file:   File
 }
-impl Barn {
-    pub fn load(file: &str) -> Barn {
-        Barn {
-            mmap: Mmap::open_path(file, Protection::ReadWrite).expect("mmap failed")
+impl<T> Barn<T> {
+    pub fn load_file(mut file: File, create: bool) -> Barn<T> {
+        let default_size = 1024 * 1024;
+        let mut file_size = file.metadata().expect("can't read metadata").len() as usize;
+        let mut needs_init = false;
+        if file_size == 0 {
+            assert_eq!(create, true);
+            println!("initializing");
+            file.set_len(default_size as u64);
+            file_size = default_size;
+            needs_init = true;
         }
-    }
-    pub fn create(file: &str, size: u64) -> Barn {
-        {
-            let mut f = File::create(file).unwrap();
-            
-            let arena_size = size as u32 - mem::size_of::<FileHeader<()>>() as u32;
-            let default = FileHeader::<()> {
-                magic:      *b"barn",                               //  4 bytes
-                version:    0,                                      //  4 bytes
-                root:       Cell::empty(),                          //  4 bytes
-                arena:      Arena::with_size(arena_size)     // 16 bytes
-            };
-            let data: [u8; 28] = unsafe {
-                mem::transmute(default)
-            };
-            f.write(&data);
-            f.set_len(size);
+        let mut mmap = Mmap::open_with_offset(&file, Protection::ReadWrite, 0, file_size)
+        .expect("mmap failed");
+        println!("mmap at {:p}", mmap.ptr());
+        
+        if needs_init {
+            let arena_size = file_size - mem::size_of::<FileHeader<()>>();
+            let header = unsafe { &mut *(mmap.mut_ptr() as *mut FileHeader<T>) };
+            header.magic = *b"barn";
+            header.version = 0;
+            header.root = Cell::empty();
+            header.arena = Arena::with_size(arena_size as u32);
+            mmap.flush().unwrap();
         }
-        Barn::load(file)
-    }
-    pub fn root<T>(&self) -> RcCell<T> {
-        let header = unsafe { &*(self.mmap.ptr() as *const FileHeader<T>) };
+        let header = unsafe { &*(mmap.ptr() as *const FileHeader<T>) };
+        
         assert_eq!(header.magic, *b"barn");
         assert_eq!(header.version, 0);
-        unsafe { header.root.wrap(&header.arena) }
+        
+        Barn {
+            mmap: mmap,
+            header: header,
+            file: file
+        }
+    }
+    
+    pub fn load_path(path: &str, create: bool) -> Barn<T> {
+        let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(create)
+        .open(path)
+        .expect("faild to open file");
+        
+        Barn::load_file(f, create)
+    }
+    
+    fn header(&self) -> &FileHeader<T> {
+        unsafe { &*self.header }
+    }
+    pub fn root(&self) -> RcCell<T> {
+        let header = self.header();
+        assert_eq!(header.magic, *b"barn");
+        assert_eq!(header.version, 0);
+        unsafe {
+            header.root.wrap(&header.arena)
+        }
+    }
+    pub fn arena(&self) -> &Arena {
+        let header = self.header();
+        assert_eq!(header.magic, *b"barn");
+        assert_eq!(header.version, 0);
+        &header.arena
     }
 }
 
 #[test]
 fn test_read() {
-    let b = Barn::create("foo.barn", 1024*1024);
+    let b: Barn<[u8; 4]> = Barn::load_path("foo.barn", true);
     {
-        let root = b.root::<Vec<u8>>();
+        let arena = b.arena();
+        let root = b.root();
         match root.get() {
-            Some(d) => println!("{:?}", d),
-            None => println!("nothing")
+            Some(d) => println!("read 1: {:?}", d),
+            None => println!("read 1: nothing")
         }
-    }
+        
+        let data = arena <- [1, 2, 3, 4u8];
+        println!("data: {:?}", data);
+        
+        root.swap(data.into_rc());
+        
+        match root.get() {
+            Some(d) => println!("read 2: {:?}", d),
+            None => println!("read 2: nothing")
+        }
+    };
 }

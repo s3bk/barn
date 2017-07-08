@@ -1,9 +1,10 @@
 #![feature(integer_atomics, allocator_api, i128_type, alloc)]
-#![feature(placement_new_protocol, nonzero)]
+#![feature(placement_new_protocol, nonzero, placement_in_syntax)]
 /**
 ## Type safety
 Type safety is ensured by storing all used types in the database.
 
+```ignore
 Items
     Primitives (numbers)            1 - 13
     bool
@@ -36,6 +37,7 @@ Owned Section (mutable, rc=1)
     
     
 Root (shared)
+```
 
 */
 
