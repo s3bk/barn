@@ -4,12 +4,14 @@ use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::*;
 use std::mem;
 use std::marker::PhantomData;
-use std::mem::{size_of, align_of};
+use std::mem::{size_of};
 use std::ops::{Place, Placer, InPlace, Deref, DerefMut};
 use std::u32;
 use core::nonzero::NonZero;
+use super::Stash;
 
 // may only be created in the file
+#[repr(C, packed)]
 pub struct Arena {
     size:           u32,       // total size in bytes
    // granularity:    usize    // minimum size of allocations,
@@ -45,6 +47,7 @@ impl Arena {
             let old_pos = self.high.load(Relaxed);
             let start = old_pos + align - (old_pos - 1) % align - 1;
             let new_pos = start + size;
+            assert!(new_pos <= self.size);
             if self.high.compare_and_swap(old_pos, new_pos, Relaxed) == old_pos {
                 return start;
             }
@@ -106,11 +109,13 @@ impl<'a, T> InPlace<T> for Hole<'a, T> {
     type Owner = Box<'a, T>;
     #[inline(always)]
     unsafe fn finalize(self) -> Box<'a, T> {
+        (*self.inner).rc.store(0, Relaxed);
         Box { inner: self.inner, arena: self.arena }
     }
 }
 
-struct Unique<T> {
+#[repr(C, packed)]
+pub struct Unique<T> {
     pos:    NonZero<u32>,
     _m:     PhantomData<T>
 }
@@ -119,8 +124,14 @@ impl<T> Unique<T> {
     pub fn pos(&self) -> u32 { self.pos.get() }
     
     #[inline(always)]
-    unsafe fn from_pos(pos: u32) -> Unique<T> {
-        Unique { pos: NonZero::new(pos), _m: PhantomData }
+    pub fn from_ptr(arena: &Arena, ptr: *mut T) -> Unique<T> {
+        Unique::from_pos(arena.pos_for_ptr(ptr))
+    }
+    
+    #[inline(always)]
+    pub fn from_pos(pos: u32) -> Unique<T> {
+        assert!(pos > 0);
+        Unique { pos: unsafe { NonZero::new(pos) }, _m: PhantomData }
     }
     
     #[inline(always)]
@@ -128,20 +139,31 @@ impl<T> Unique<T> {
         arena.ptr_for_pos::<T>(self.pos.get()) as *mut T
     }
 }
+impl<T> Clone for Unique<T> {
+    fn clone(&self) -> Self {
+        Unique { pos: self.pos, _m: PhantomData }
+    }
+}
+impl<T> Copy for Unique<T> {}
 
 /*
 refcount = 1 -> one active user
 refcount = 0 locked by one user, refcount can't be increased by others
 */
-#[derive(Copy, Clone)]
-struct Shared<T> {
+#[repr(C, packed)]
+pub struct Shared<T> {
     pos:    NonZero<u32>,
     _m:     PhantomData<T>
 }
 impl<T> Shared<T> {
     #[inline(always)]
-    unsafe fn from_pos(pos: u32) -> Shared<T> {
-        Shared { pos: NonZero::new(pos), _m: PhantomData }
+    fn from_pos(pos: u32) -> Shared<T> {
+        assert!(pos > 0);
+        Shared { pos: unsafe { NonZero::new(pos) }, _m: PhantomData }
+    }
+    #[inline(always)]
+    pub fn from_ptr(arena: &Arena, ptr: *const T) -> Shared<T> {
+        Shared::from_pos(arena.pos_for_ptr(ptr))
     }
     #[inline(always)]
     fn pos(self) -> u32 {
@@ -152,7 +174,14 @@ impl<T> Shared<T> {
         arena.ptr_for_pos(self.pos.get()) as *const T
     }
 }
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Shared { pos: self.pos, _m: PhantomData }
+    }
+}
+impl<T> Copy for Shared<T> {}
 
+#[repr(C, packed)]
 pub struct Data<T> {
     rc:     AtomicU32,
     data:   T
@@ -202,6 +231,15 @@ impl<'a, T, U> PartialEq<U> for Box<'a, T> where T: PartialEq<U> {
 impl<'a, T: fmt::Debug> fmt::Debug for Box<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         (self as &T).fmt(f)
+    }
+}
+unsafe impl<'a, T> Stash<'a> for Box<'a, T> {
+    type Packed = Unique<Data<T>>;
+    fn pack(self) -> Self::Packed {
+        Unique::from_ptr(self.arena, self.inner)
+    }
+    fn unpack(a: &'a Arena, p: Self::Packed) -> Self {
+        Box { inner: p.ptr(a), arena: a }
     }
 }
 
@@ -263,6 +301,15 @@ impl<'a, T> Deref for Rc<'a, T> {
 impl<'a, T: fmt::Debug> fmt::Debug for Rc<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         self.inner().data.fmt(f)
+    }
+}
+unsafe impl<'a, T> Stash<'a> for Rc<'a, T> {
+    type Packed = Shared<Data<T>>;
+    fn pack(self) -> Self::Packed {
+        Shared::from_ptr(self.arena, self.inner)
+    }
+    fn unpack(a: &'a Arena, p: Self::Packed) -> Self {
+        Rc { inner: p.ptr(a), arena: a }
     }
 }
 

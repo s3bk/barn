@@ -4,65 +4,11 @@ store data aligned correctly
 
 */
 use memmap::{Mmap, Protection};
-use std::{mem, ptr, slice};
+use std::{mem};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
-use arena::{Arena, Cell, RcCell};
+use super::{Arena, Cell, RcCell};
 
-pub struct Reader<'a> {
-    data:       &'a [u8]
-}
-impl<'a> Reader<'a> {
-    pub fn read(&mut self, len: usize) -> &[u8] {
-        let (buf, remaining) = self.data.split_at(len);
-        self.data = remaining;
-        buf
-    }
-    pub fn decode<T: Copy>(&mut self) -> T {
-        let size = mem::size_of::<T>();
-        let buf = self.read(size);
-        let mut val: T;
-        unsafe {
-            val = mem::uninitialized();
-            ptr::copy_nonoverlapping(buf.as_ptr(), &mut val as *mut T as *mut u8, size);
-        }
-        val
-    }
-}
-pub struct Writer<'a> {
-    data:   &'a mut [u8]
-}
-impl<'a> Writer<'a> {
-    pub fn write(&mut self, n: usize) -> &'a mut [u8] {
-        let ptr = self.data.as_mut_ptr();
-        let len = self.data.len();
-        assert!(n <= len);
-        // both sides are still valid for 'a
-        unsafe {
-            // [n .. len]
-            self.data = slice::from_raw_parts_mut(ptr.offset(n as isize), len - n);
-            
-            // [0.. n]
-            slice::from_raw_parts_mut(ptr, n)
-        }
-    }
-    pub fn encode<T: Copy>(&mut self, val: &T) {
-        let size = mem::size_of::<T>();
-        
-        let buf = self.write(size);
-        unsafe {
-            ptr::copy_nonoverlapping(val as *const T as *const u8, buf.as_mut_ptr(), size);
-        }
-    }
-}
-pub enum Offset {
-    Close(u8),  // 8 bit
-    Near(u16),   // 16 bit
-    Mid(u32),    // 32 bit
-    Far(u64)     // 64 bit
-}    
-
-#[repr(packed)]
+#[repr(C, packed)] // need repr(C), as we rely on Arena being the last field
 struct FileHeader<T> {
     magic:      [u8; 4], // b"barn"
     version:    u32,
@@ -71,19 +17,19 @@ struct FileHeader<T> {
 }
 
 pub struct Barn<T> {
-    mmap:   Mmap,
     header: *const FileHeader<T>,
-    file:   File
+    _mmap:   Mmap, // both mmap and
+    _file:   File  // file need to stay alive!
 }
 impl<T> Barn<T> {
-    pub fn load_file(mut file: File, create: bool) -> Barn<T> {
+    pub fn load_file(file: File, create: bool) -> Barn<T> {
         let default_size = 1024 * 1024;
         let mut file_size = file.metadata().expect("can't read metadata").len() as usize;
         let mut needs_init = false;
         if file_size == 0 {
             assert_eq!(create, true);
             println!("initializing");
-            file.set_len(default_size as u64);
+            file.set_len(default_size as u64).expect("failed to resize file");
             file_size = default_size;
             needs_init = true;
         }
@@ -106,9 +52,9 @@ impl<T> Barn<T> {
         assert_eq!(header.version, 0);
         
         Barn {
-            mmap: mmap,
             header: header,
-            file: file
+            _mmap: mmap,
+            _file: file
         }
     }
     

@@ -45,25 +45,19 @@ extern crate memmap;
 extern crate alloc;
 extern crate core;
 
+#[macro_use]
+mod stash;
 mod data;
 mod arena;
 mod types;
 
-use data::{Writer, Reader};
-use arena::*;
-//use types::Encoder;
+pub use arena::*;
+pub use stash::*;
+pub use data::*;
 
 /// stores information about a type
 pub struct Species {}
 
-pub unsafe trait Stash<'a> {
-    type Packed: Copy;
-    
-    //fn get_type(t: &mut TypeWriter);
-    
-    fn pack(self) -> Self::Packed;
-    fn unpack(a: &'a Arena, p: Self::Packed) -> Self;
-}
 
 macro_rules! field {
     ($typewriter:ident, $selv:ident . $field:ident) => (
