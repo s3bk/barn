@@ -1,11 +1,11 @@
 use alloc::raw_vec::RawVec;
-use super::{Arena, Unique};
+use super::{Heap, Unique};
 
 pub unsafe trait Stash<'a> {
     type Packed;
     
     fn pack(self) -> Self::Packed;
-    fn unpack(a: &'a Arena, p: Self::Packed) -> Self;
+    fn unpack(a: &'a Heap, p: Self::Packed) -> Self;
 }
 
 #[macro_export]
@@ -15,7 +15,7 @@ macro_rules! impl_copy_stash {
             type Packed = Self;
             
             fn pack(self) -> Self { self }
-            fn unpack(a: &'a Arena, p: Self) -> Self { p }
+            fn unpack(a: &'a Heap, p: Self) -> Self { p }
         }
     )
 }
@@ -27,19 +27,19 @@ pub struct PackedRawVec<T> {
     cap:    u32
 }
 
-unsafe impl<'a, T> Stash<'a> for RawVec<T, &'a Arena> {
+unsafe impl<'a, T> Stash<'a> for RawVec<T, &'a Heap> {
     type Packed = PackedRawVec<T>;
     
     fn pack(self) -> Self::Packed {
         let (ptr, cap, a) = self.into_raw_parts();
         PackedRawVec {
-            pos: Unique::from_ptr(a, ptr),
+            pos: Unique::from_ptr(a.arena(), ptr),
             cap: cap as u32
         }
     }
-    fn unpack(a: &'a Arena, p: Self::Packed) -> Self {
+    fn unpack(a: &'a Heap, p: Self::Packed) -> Self {
         unsafe {
-            RawVec::from_raw_parts_in(p.pos.ptr(a), p.cap as usize, a)
+            RawVec::from_raw_parts_in(p.pos.ptr(a.arena()), p.cap as usize, a)
         }
     }
 }
@@ -49,7 +49,7 @@ pub struct PackedVec<T> {
     raw: PackedRawVec<T>,
     len: u32
 }
-unsafe impl<'a, T> Stash<'a> for Vec<T, &'a Arena> {
+unsafe impl<'a, T> Stash<'a> for Vec<T, &'a Heap> {
     type Packed = PackedVec<T>;
     
     fn pack(self) -> Self::Packed {
@@ -60,7 +60,7 @@ unsafe impl<'a, T> Stash<'a> for Vec<T, &'a Arena> {
         }
     }
     
-    fn unpack(a: &'a Arena, p: Self::Packed) -> Self {
+    fn unpack(a: &'a Heap, p: Self::Packed) -> Self {
         unsafe {
             Vec::from_raw_vec_and_len(RawVec::unpack(a, p.raw), p.len as usize)
         }

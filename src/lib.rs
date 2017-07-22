@@ -1,5 +1,6 @@
-#![feature(integer_atomics, allocator_api, i128_type, alloc)]
-#![feature(placement_new_protocol, nonzero, placement_in_syntax)]
+
+#![feature(integer_atomics, allocator_api, i128_type, alloc, unique)]
+#![feature(placement_new_protocol, nonzero, placement_in_syntax, shared)]
 /**
 ## Type safety
 Type safety is ensured by storing all used types in the database.
@@ -44,58 +45,31 @@ Root (shared)
 extern crate memmap;
 extern crate alloc;
 extern crate core;
+extern crate parking_lot;
 
+#[macro_use]
+mod util;
 #[macro_use]
 mod stash;
 mod data;
 mod arena;
-mod types;
 
 pub use arena::*;
 pub use stash::*;
 pub use data::*;
 
-/// stores information about a type
-pub struct Species {}
+const SUPER_BLOCK_SIZE: usize = 16 * 1024;
 
-
-macro_rules! field {
-    ($typewriter:ident, $selv:ident . $field:ident) => (
-        t.add_field(stringify!($field), $field as usize - $selv as usize, &$selv.$field);
-    )
-}
-
-#[test]
-fn increment() {
-    
-}
-/*
-#[test]
-fn test_barn() {
-
-    #[derive(Barn)]
-    struct Adress {
-        house_nr:   u16,
-        street:     String,
-        city:       String,
-        country:    String
-    }
-    impl Stash for Adress {
-        fn encode_type(&self, t: &mut Encoder) {
-            t.add_struct("Adress", |t| {
-                field!(t, self.housr_nr);
-                field!(t, self.street);
-                field!(t, self.city);
-                field!(t, self.country);
-            });
-        }
-    }
-
-    #[derive(Barn)]
-    struct Letter {
-        sender: (String, Adress),
-        recipient: (String, Adress),
-        content:    Vec<String>
+#[inline(always)]
+fn round_up(n: usize, k: usize) -> usize {
+    let c = n % k;
+    if c == 0 {
+        n
+    } else {
+        (n + k) - c
     }
 }
-*/
+
+fn div_ceil(n: usize, div: usize) -> usize {
+    round_up(n, div) / div // could be faster?
+}

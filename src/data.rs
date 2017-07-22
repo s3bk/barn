@@ -3,27 +3,40 @@
 store data aligned correctly
 
 */
-use memmap::{Mmap, Protection};
+use memmap::{self, MmapMut, Protection};
 use std::{mem};
 use std::fs::{File, OpenOptions};
-use super::{Arena, Cell, RcCell};
+use std::sync::Arc;
+use std::fmt::Debug;
+use super::*;
+use parking_lot::Mutex;
 
-#[repr(C, packed)] // need repr(C), as we rely on Arena being the last field
-struct FileHeader<T> {
-    magic:      [u8; 4], // b"barn"
-    version:    u32,
-    root:       Cell<T>,
-    arena:      Arena
+fn try_n<F, T, E>(n: usize, mut f: F) -> Result<T, E> where F: FnMut() -> Result<T, E>, E: Debug {
+    let mut res = f();
+    for _ in 1 .. n-1 {
+        match res {
+            Ok(v) => return Ok(v),
+            Err(e) => println!("Err: {:?}", e)
+        }
+        res = f();
+    }
+    f()
 }
 
-pub struct Barn<T> {
-    header: *const FileHeader<T>,
-    _mmap:   Mmap, // both mmap and
-    _file:   File  // file need to stay alive!
+pub struct BarnInner {
+    size:   usize,
+    mmaps:  Vec<MmapMut>, // both mmap and
+    file:   File  // file need to stay alive!
 }
-impl<T> Barn<T> {
-    pub fn load_file(file: File, create: bool) -> Barn<T> {
-        let default_size = 1024 * 1024;
+pub struct Barn {
+    arena:  *const Arena,
+    inner:  Mutex<BarnInner>,
+}
+impl Barn {
+    pub fn load_file(file: File, create: bool) -> Arc<Barn> {
+        assert!(size!(Arena) <= SUPER_BLOCK_SIZE);
+    
+        let default_size = 128 * SUPER_BLOCK_SIZE;
         let mut file_size = file.metadata().expect("can't read metadata").len() as usize;
         let mut needs_init = false;
         if file_size == 0 {
@@ -33,32 +46,49 @@ impl<T> Barn<T> {
             file_size = default_size;
             needs_init = true;
         }
-        let mut mmap = Mmap::open_with_offset(&file, Protection::ReadWrite, 0, file_size)
-        .expect("mmap failed");
-        println!("mmap at {:p}", mmap.ptr());
-        
-        if needs_init {
-            let arena_size = file_size - mem::size_of::<FileHeader<()>>();
-            let header = unsafe { &mut *(mmap.mut_ptr() as *mut FileHeader<T>) };
-            header.magic = *b"barn";
-            header.version = 0;
-            header.root = Cell::empty();
-            header.arena = Arena::with_size(arena_size as u32);
-            mmap.flush().unwrap();
-        }
-        let header = unsafe { &*(mmap.ptr() as *const FileHeader<T>) };
-        
-        assert_eq!(header.magic, *b"barn");
-        assert_eq!(header.version, 0);
-        
-        Barn {
-            header: header,
-            _mmap: mmap,
-            _file: file
-        }
+        let (mmap, arena) = {
+            let mut base = 0;
+            let mut mmap = try_n(10, || {
+                let mut cfg = unsafe { memmap::file(&file) };
+                cfg.len(file_size);
+                cfg.protection(Protection::ReadWrite);
+                cfg.addr(base as *mut u8);
+                let mmap = cfg.map_mut().expect("failed to mmap");
+                let p = mmap.as_ptr() as usize;
+                log!("requested: {:16x}, got: {:16x}", base, p);
+                if p % SUPER_BLOCK_SIZE == 0 {
+                    Ok(mmap)
+                } else {
+                    base = round_up(p, SUPER_BLOCK_SIZE);
+                    Err(())
+                }
+            }).expect("failed to open mmap");
+            println!("mmap at {:p}", mmap.as_ptr());
+
+            unsafe {
+                if needs_init {
+                    let arena = &mut *(mmap.as_mut_ptr() as *mut Arena);
+                    arena.init(file_size);
+                }
+
+                let ptr = mmap.as_ptr();
+                assert_eq!((ptr as usize) % SUPER_BLOCK_SIZE, 0);
+                let arena = ptr as *const Arena;
+                (mem::transmute(mmap), arena)
+            }
+        };
+                
+        Arc::new(Barn {
+            arena:  arena,
+            inner:  Mutex::new(BarnInner{
+                file:   file,
+                size:   file_size,
+                mmaps:  vec![mmap]
+            })
+        })
     }
     
-    pub fn load_path(path: &str, create: bool) -> Barn<T> {
+    pub fn load_path(path: &str, create: bool) -> Arc<Barn> {
         let f = OpenOptions::new()
         .read(true)
         .write(true)
@@ -69,37 +99,51 @@ impl<T> Barn<T> {
         Barn::load_file(f, create)
     }
     
-    fn header(&self) -> &FileHeader<T> {
-        unsafe { &*self.header }
+    pub fn inner(&self) -> &Mutex<BarnInner> {
+        &self.inner
     }
-    pub fn root(&self) -> RcCell<T> {
-        let header = self.header();
-        assert_eq!(header.magic, *b"barn");
-        assert_eq!(header.version, 0);
-        unsafe {
-            header.root.wrap(&header.arena)
-        }
-    }
+    
     pub fn arena(&self) -> &Arena {
-        let header = self.header();
-        assert_eq!(header.magic, *b"barn");
-        assert_eq!(header.version, 0);
-        &header.arena
+        unsafe { &*self.arena }
+    }
+    
+    pub fn root<T>(&self) -> RcCell<T> {
+        self.arena().root()
+    }
+}
+impl BarnInner {
+    pub fn grow(&mut self) -> (usize, usize) {
+        let base = self.mmaps.last().unwrap().as_ptr();
+        let additional = round_up(self.size / 4, SUPER_BLOCK_SIZE);
+        let old_size = self.size;
+        let new_size = self.size + additional;
+        let mut cfg = unsafe { memmap::file(&self.file) };
+        cfg.offset(self.size);
+        cfg.len(additional);
+        cfg.protection(Protection::ReadWrite);
+        cfg.addr(unsafe { base.offset(additional as isize) as *mut u8 });
+        let mmap = cfg.map_mut().expect("failed to grow");
+        println!("growing mmap at {:p}", mmap.as_ptr());
+        self.mmaps.push(mmap);
+        self.size = new_size;
+        
+        
+        (old_size, additional)
     }
 }
 
 #[test]
 fn test_read() {
-    let b: Barn<[u8; 4]> = Barn::load_path("foo.barn", true);
+    let b = Barn::load_path("foo.barn", true);
     {
-        let arena = b.arena();
         let root = b.root();
         match root.get() {
             Some(d) => println!("read 1: {:?}", d),
             None => println!("read 1: nothing")
         }
+        let heap = Heap::new(&b);
         
-        let data = arena <- [1, 2, 3, 4u8];
+        let data = &heap <- [1, 2, 3, 4u8];
         println!("data: {:?}", data);
         
         root.swap(data.into_rc());

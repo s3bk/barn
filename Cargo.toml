@@ -7,5 +7,8 @@ license = "MIT"
 repository = "https://github.com/s3bk/barn.git"
 
 [dependencies]
-memmap = "*"
-ordermap = { path = "../ordermap" }
+memmap = { git = "https://github.com/s3bk/memmap-rs.git" }
+parking_lot = "*"
+
+[dev-dependencies]
+simple-signal = "*"
