@@ -1,12 +1,15 @@
-use std::{fmt, ptr, u32};
+use std::{fmt, ptr, u32, cmp, mem};
 use alloc::allocator::{Alloc, Layout, AllocErr};
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::atomic::Ordering::*;
 use std::marker::PhantomData;
 use std::ops::{Place, Placer, InPlace, Deref, DerefMut};
 use std::cell::Cell;
+use std::time::Duration;
+use std::clone::Clone;
 use core::nonzero::NonZero;
 use super::*;
+use linux::*;
 use std::sync::Arc;
 
 pub trait OffsetScale {
@@ -75,6 +78,11 @@ impl<I, O, S: OffsetScale> RelOffset<I, O, S> {
         RelOffset::new(S::unscale(ptr as usize - base as usize))
     }
 }
+impl<I, O, S: OffsetScale> cmp::PartialEq for RelOffset<I, O, S> {
+    fn eq(&self, rhs: &Self) -> bool {
+        self.pos() == rhs.pos()
+    }
+}
 impl<I, O, S: OffsetScale> fmt::Debug for RelOffset<I, O, S> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "RelOffset({} -> {})", self.pos(), self.offset())
@@ -117,7 +125,7 @@ impl<B, T, S> List<B, T, S> where T: ListTarget, S: OffsetScale {
     /// this means we have ownership of this position
     #[inline(always)]
     fn push(&self, base: &B, pos: RelOffset<B, T, S>) {
-        //log!("push({:?})", pos);
+        log!("push({:?})", pos);
         // get the old head
         let mut old_head = self.head.load(Relaxed);
         loop {
@@ -138,6 +146,7 @@ impl<B, T, S> List<B, T, S> where T: ListTarget, S: OffsetScale {
     
     fn pop(&self, base: &B) -> Option<RelOffset<B, T, S>> {
         let v = self._pop(base);
+        vlog!(self.head);
         log!("pop() -> {:?}", v);
         v
     }
@@ -145,6 +154,7 @@ impl<B, T, S> List<B, T, S> where T: ListTarget, S: OffsetScale {
     #[inline(always)]
     fn _pop(&self, base: &B) -> Option<RelOffset<B, T, S>> {
         let mut old_head = self.head.load(Relaxed);
+        vlog!(old_head);
         loop {
             // if old_head isn't NULL
             let head: RelOffset<B, T, S> = match old_head {
@@ -154,11 +164,11 @@ impl<B, T, S> List<B, T, S> where T: ListTarget, S: OffsetScale {
             
             // the node the head points to
             let node = unsafe { head.get(base) };
-            //log!("node at {:p}, AtomicU32 at {:p} {:?}", node, node.next(), node.next());
+            log!("node at {:p}, AtomicU32 at {:p} {:?}", node, node.next(), node.next());
             
             // fetch the next offset
             let next_off = node.next().load(Relaxed);
-            //vlog!(next_off);
+            vlog!(next_off);
             
             // and write it to the list head
             match self.head.compare_exchange(old_head, next_off, Relaxed, Relaxed) {
@@ -354,7 +364,7 @@ pub struct Arena {
     free:       List<Arena, SuperBlock, SuperBlockScale>,
     capacity:   AtomicU32, // in SuperBlocks
     
-    root:       AtomicU32, // Actually a DataCell
+    root:       RcDataCell<()>,
     // bit is zero: not partially full (either in free or managed by a heap)
     // bit is one: not managed by a heap an and not in free
     partial:    [[AtomicU64; (SUPER_BLOCK_SIZE - 12) / NUM_SIZE_CLASSES / 8]; NUM_SIZE_CLASSES] // put highest possible number here…
@@ -390,7 +400,7 @@ impl Arena {
     
     pub fn root<T>(&self) -> RcCell<T> {
         self.check_header();
-        let cell = unsafe { &*(&self.root as *const AtomicU32 as *const DataCell<T>) };
+        let cell = unsafe { &*(&self.root as *const RcDataCell<()> as *const RcDataCell<T>) };
         RcCell::from_raw(cell, self)
     }
 
@@ -651,11 +661,18 @@ impl<T> Unique<T> {
         unsafe { self.off.get_as_mut(arena) }
     }
 }
+impl<T> cmp::PartialEq for Unique<T> {
+    fn eq(&self, rhs: &Self) -> bool {
+        self.off == rhs.off
+    }
+}
+
+
 /*
 refcount = 1 -> one active user
 refcount = 0 locked by one user, refcount can't be increased by others
 */
-#[derive(Copy, Clone)]
+
 #[repr(C, packed)]
 pub struct Shared<T> {
     off:    RelOffset<Arena, T, Unity>
@@ -678,6 +695,17 @@ impl<T> Shared<T> {
         unsafe { self.off.get(arena) }
     }
 }
+impl<T> cmp::PartialEq for Shared<T> {
+    fn eq(&self, rhs: &Self) -> bool {
+        self.off == rhs.off
+    }
+}
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Shared<T> {
+        Shared { off: self.off }
+    }
+}
+impl<T> Copy for Shared<T> {}
 
 #[repr(C, packed)]
 pub struct Data<T> {
@@ -696,10 +724,12 @@ impl<'a, T: 'a> Box<'a, T> {
     pub fn into_rc(self) -> Rc<'a, T> {
         // set refcount to one
         self.inner().rc.store(1, Release);
-        Rc {
+        let rc = Rc {
             inner:  self.inner,
             arena:  self.arena
-        }
+        };
+        mem::forget(self);
+        rc
     }
 }
 impl<'a, T: 'a> Drop for Box<'a, T> {
@@ -734,7 +764,9 @@ impl<'a, T: fmt::Debug> fmt::Debug for Box<'a, T> {
 unsafe impl<'a, T> Stash<'a> for Box<'a, T> {
     type Packed = Unique<Data<T>>;
     fn pack(self) -> Self::Packed {
-        Unique::from_ptr(self.arena, self.inner)
+        let p = Unique::from_ptr(self.arena, self.inner);
+        mem::forget(self);
+        p
     }
     fn unpack(heap: &'a Heap, p: Self::Packed) -> Self {
         Box { inner: p.ptr(heap.arena()), arena: heap.arena() }
@@ -774,13 +806,24 @@ impl<'a, T: 'a> Rc<'a, T> {
         }
     }
     fn to_shared(self) -> Shared<Data<T>> {
-        Shared::from_pos(RelOffset::from_ptr(self.arena, self.inner))
+        let s = Shared::from_pos(self.offset());
+        mem::forget(self);
+        s
+    }
+    fn offset(&self) -> RelOffset<Arena, Data<T>, Unity> {
+        RelOffset::from_ptr(self.arena, self.inner)
     }
 }
 impl<'a, T> Drop for Rc<'a, T> {
     fn drop(&mut self) {
+        log!("Rc::drop");
+
         // if the refcount was one, we have to drop it
-        if self.inner().rc.fetch_sub(1, Release) == 1 {
+        let refcount = self.inner().rc.fetch_sub(1, Release);
+        assert!(refcount > 0);
+
+        if refcount == 1 {
+            log!("deallocating");
             unsafe {
                 Heap::deallocate_one(self.inner as *mut Data<T>);
             }
@@ -802,7 +845,9 @@ impl<'a, T: fmt::Debug> fmt::Debug for Rc<'a, T> {
 unsafe impl<'a, T> Stash<'a> for Rc<'a, T> {
     type Packed = Shared<Data<T>>;
     fn pack(self) -> Self::Packed {
-        Shared::from_ptr(self.arena, self.inner)
+        let p = Shared::from_ptr(self.arena, self.inner);
+        mem::forget(self);
+        p
     }
     fn unpack(a: &'a Heap, p: Self::Packed) -> Self {
         Rc { inner: p.ptr(a.arena()), arena: a.arena() }
@@ -855,29 +900,29 @@ impl<T> DataCell<T> {
         self.put(new);
         out
     }
-    
-    pub unsafe fn wrap<'a>(&'a self, arena: &'a Arena) -> RcCell<'a, T> {
-        RcCell {
-            cell:  self,
-            arena: arena
-        }
-    }
 }
 
+pub struct RcDataCell<T> {
+    cell:    DataCell<T>,
+    waiting: AtomicU32
+}
+
+pub struct WaitError;
+
 pub struct RcCell<'a, T: 'a> {
-    cell:   &'a DataCell<T>,
+    inner:  &'a RcDataCell<T>,
     arena:  &'a Arena
 }
 impl<'a, T: 'a> RcCell<'a, T> {
-    pub fn from_raw(cell: &'a DataCell<T>, arena:  &'a Arena) -> RcCell<'a, T> {
+    pub fn from_raw(inner: &'a RcDataCell<T>, arena:  &'a Arena) -> RcCell<'a, T> {
         RcCell {
-            cell: cell,
+            inner: inner,
             arena: arena
         }
     }
 
     pub fn get(&self) -> Option<Rc<'a, T>> {
-        self.cell.swap(|c| match c {
+        self.inner.cell.swap(|c| match c {
             None => (None, None),
             Some(p) => {
                 let rc = Rc::from_shared(self.arena, p);
@@ -887,9 +932,44 @@ impl<'a, T: 'a> RcCell<'a, T> {
     }
     
     pub fn swap(&self, rc: Rc<'a, T>) -> Option<Rc<'a, T>> {
-        self.cell.swap(|c| (
-            Some(rc.to_shared()),                       // value to be stored
-            c.map(|p| Rc::from_shared(self.arena, p))   // value returned
-        ))
+        let new_val = Some(rc.to_shared());
+        let old_val = self.inner.cell.swap(|c| (
+            new_val,   // value to be stored
+            c          // value returned
+        ));
+
+        if new_val != old_val {
+            let waiting = self.inner.waiting.load(Relaxed);
+            vlog!(waiting);
+            if waiting != 0 {
+                futex::wake_all(&self.inner.cell.pos).unwrap();
+            }
+        }
+
+        old_val.map(|v| Rc::from_shared(self.arena, v))
     }
+
+    pub fn wait(&self, old: Option<&Rc<'a, T>>, timeout: Option<Duration>) -> Option<Rc<'a, T>> {
+        let old_val = old.map(|p| p.offset().pos()).unwrap_or(0);
+        with(&self.inner.waiting, move || {
+            // current value
+            let val = self.inner.cell.pos.load(Relaxed);
+
+            // it already changed
+            if val != old_val {
+                return Ok(());
+            }
+
+            futex::wait(&self.inner.cell.pos, val, timeout)
+        }).expect("failed to wait");
+        
+        self.get()
+    }
+}
+
+fn with<F: FnOnce() -> O, O>(counter: &AtomicU32, f: F) -> O {
+    counter.fetch_add(1, Acquire);
+    let o = f();
+    counter.fetch_sub(1, Release);
+    o
 }

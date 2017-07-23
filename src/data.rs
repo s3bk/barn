@@ -111,6 +111,13 @@ impl Barn {
         self.arena().root()
     }
 }
+impl Drop for Barn {
+    fn drop(&mut self) {
+        let mut inner = self.inner.lock();
+        for _ in inner.mmaps.drain(..) {
+        }
+    }
+}
 impl BarnInner {
     pub fn grow(&mut self) -> (usize, usize) {
         let base = self.mmaps.last().unwrap().as_ptr();
@@ -123,7 +130,9 @@ impl BarnInner {
         cfg.protection(Protection::ReadWrite);
         cfg.addr(unsafe { base.offset(additional as isize) as *mut u8 });
         let mmap = cfg.map_mut().expect("failed to grow");
-        println!("growing mmap at {:p}", mmap.as_ptr());
+        let ptr = mmap.as_ptr() as usize;
+        assert_eq!(ptr as usize, base as usize + old_size);
+        println!("growing mmap at {:x}", ptr);
         self.mmaps.push(mmap);
         self.size = new_size;
         

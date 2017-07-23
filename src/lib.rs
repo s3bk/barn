@@ -1,6 +1,7 @@
 
 #![feature(integer_atomics, allocator_api, i128_type, alloc, unique)]
 #![feature(placement_new_protocol, nonzero, placement_in_syntax, shared)]
+#![feature(libc)]
 /**
 ## Type safety
 Type safety is ensured by storing all used types in the database.
@@ -46,6 +47,8 @@ extern crate memmap;
 extern crate alloc;
 extern crate core;
 extern crate parking_lot;
+extern crate libc;
+extern crate syscall_alt;
 
 #[macro_use]
 mod util;
@@ -53,6 +56,7 @@ mod util;
 mod stash;
 mod data;
 mod arena;
+mod linux;
 
 pub use arena::*;
 pub use stash::*;

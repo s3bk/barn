@@ -28,3 +28,19 @@ macro_rules! vlog {
 macro_rules! log {
     ($msg:expr $(,$args:expr)*) => (eprintln!($msg $(, $args)*))
 }
+
+use libc;
+use std::{time, ptr};
+
+#[inline(always)]
+pub fn ptr_opt<T>(r: Option<&T>) -> *const T {
+    r.map(|r| r as *const T).unwrap_or(ptr::null())
+}
+
+#[inline(always)]
+pub fn timespec(t: time::Duration) -> libc::timespec {
+    libc::timespec {
+        tv_sec:  t.as_secs() as i64,
+        tv_nsec: t.subsec_nanos() as i64
+    }
+}

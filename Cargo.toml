@@ -1,6 +1,6 @@
 [package]
 name = "barn"
-version = "0.0.0"
+version = "0.0.1"
 authors = ["Sebastian Köln <sebk@rynx.org>"]
 description = "Provides persistent space for Copy-On-Write structures and other animals."
 license = "MIT"
@@ -9,6 +9,7 @@ repository = "https://github.com/s3bk/barn.git"
 [dependencies]
 memmap = { git = "https://github.com/s3bk/memmap-rs.git" }
 parking_lot = "*"
+syscall-alt = "*"
 
 [dev-dependencies]
 simple-signal = "*"
