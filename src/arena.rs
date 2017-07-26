@@ -600,6 +600,7 @@ unsafe impl Alloc for Heap {
         self.deallocate(ptr, layout)
     }
 }
+
 unsafe impl<'a> Alloc for &'a Heap {
     #[inline(always)]
     unsafe fn alloc(&mut self, layout: Layout) -> Result<*mut u8, AllocErr> {
@@ -761,17 +762,6 @@ impl<'a, T: fmt::Debug> fmt::Debug for Box<'a, T> {
         (self as &T).fmt(f)
     }
 }
-unsafe impl<'a, T> Stash<'a> for Box<'a, T> {
-    type Packed = Unique<Data<T>>;
-    fn pack(self) -> Self::Packed {
-        let p = Unique::from_ptr(self.arena, self.inner);
-        mem::forget(self);
-        p
-    }
-    fn unpack(heap: &'a Heap, p: Self::Packed) -> Self {
-        Box { inner: p.ptr(heap.arena()), arena: heap.arena() }
-    }
-}
 
 #[derive(Clone)]
 pub struct Rc<'a, T: 'a> {
@@ -842,17 +832,34 @@ impl<'a, T: fmt::Debug> fmt::Debug for Rc<'a, T> {
         self.inner().data.fmt(f)
     }
 }
-unsafe impl<'a, T> Stash<'a> for Rc<'a, T> {
-    type Packed = Shared<Data<T>>;
+
+impl<'a, T: Relative + 'a> Packable for Box<'a, T> {
+    type Packed = Unique<Data<T>>;
+}
+unsafe impl<'a, T: Relative + 'a> Stash<'a> for Box<'a, T> {
+    fn pack(self) -> Self::Packed {    
+        let p = Unique::from_ptr(self.arena, self.inner);
+        mem::forget(self);
+        p
+    }
+    fn unpack(heap: &'a Heap, p: Self::Packed) -> Self {
+        Box { inner: p.ptr(heap.arena()), arena: heap.arena() }
+    }
+}
+impl<'a, T: Relative + 'a> Packable for Rc<'a, T> {
+     type Packed = Shared<Data<T>>;
+}
+unsafe impl<'a, T: Relative + 'a> Stash<'a> for Rc<'a, T> {   
     fn pack(self) -> Self::Packed {
         let p = Shared::from_ptr(self.arena, self.inner);
         mem::forget(self);
         p
     }
-    fn unpack(a: &'a Heap, p: Self::Packed) -> Self {
-        Rc { inner: p.ptr(a.arena()), arena: a.arena() }
+    fn unpack(heap: &'a Heap, p: Self::Packed) -> Self {
+        Rc { inner: p.ptr(heap.arena()), arena: heap.arena() }
     }
 }
+
 
 pub struct DataCell<T> {
     pos:    AtomicU32, // points to a shared Data<T>

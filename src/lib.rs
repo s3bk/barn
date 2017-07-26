@@ -1,4 +1,3 @@
-
 #![feature(integer_atomics, allocator_api, i128_type, alloc, unique)]
 #![feature(placement_new_protocol, nonzero, placement_in_syntax, shared)]
 #![feature(libc)]
@@ -49,6 +48,8 @@ extern crate core;
 extern crate parking_lot;
 extern crate libc;
 extern crate syscall_alt;
+extern crate istring;
+#[macro_use] extern crate tuple;
 
 #[macro_use]
 mod util;

@@ -8,8 +8,10 @@ repository = "https://github.com/s3bk/barn.git"
 
 [dependencies]
 memmap = { git = "https://github.com/s3bk/memmap-rs.git" }
+istring = { git = "https://github.com/s3bk/istring.git" }
 parking_lot = "*"
 syscall-alt = "*"
+tuple = "*"
 
 [dev-dependencies]
 simple-signal = "*"
