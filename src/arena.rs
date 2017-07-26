@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::atomic::Ordering::*;
 use std::marker::PhantomData;
 use std::ops::{Place, Placer, InPlace, Deref, DerefMut};
+use std::hash::{Hash, Hasher};
+use std::cmp::{PartialEq, Eq};
 use std::cell::Cell;
 use std::time::Duration;
 use std::clone::Clone;
@@ -859,7 +861,20 @@ unsafe impl<'a, T: Relative + 'a> Stash<'a> for Rc<'a, T> {
         Rc { inner: p.ptr(heap.arena()), arena: heap.arena() }
     }
 }
-
+impl<'a, T: Relative + 'a> PartialEq for Rc<'a, T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+    fn ne(&self, other: &Self) -> bool {
+        self.inner != other.inner
+    }
+}
+impl<'a, T: Relative + 'a> Eq for Rc<'a, T> {}
+impl<'a, T: Relative + 'a> Hash for Rc<'a, T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.inner.hash(state)
+    }
+}
 
 pub struct DataCell<T> {
     pos:    AtomicU32, // points to a shared Data<T>

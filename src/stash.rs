@@ -10,7 +10,12 @@ use tuple;
 pub unsafe trait Relative {}
 
 macro_rules! impl_relative {
-    ($($t:ty),*) => ($(unsafe impl Relative for $t {})*)
+    ($($t:ty),*) => ($(
+        unsafe impl Relative for $t {}
+        impl Packable for $t {
+            type Packed = $t;
+        }
+    )*)
 }
 impl_relative!((), bool, u8, i8, u16, i16, u32, i32, u64, i64, u128, i128, f32, f64);
 macro_rules! impl_array {
@@ -26,10 +31,11 @@ unsafe impl<T: Relative> Relative for Data<T> {}
 pub trait Packable {
     type Packed: Relative;
 }
+/*
 impl<T: Relative> Packable for T {
     type Packed = T;
 }
-
+*/
 /// Utility trait to transition between Relative and Absolute references
 pub unsafe trait Stash<'a>: Packable {
     fn pack(self) -> Self::Packed;
