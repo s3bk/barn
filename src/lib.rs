@@ -1,6 +1,6 @@
 #![feature(integer_atomics, allocator_api, i128_type, alloc, unique)]
 #![feature(placement_new_protocol, nonzero, placement_in_syntax, shared)]
-#![feature(libc)]
+#![feature(libc, nonnull_slice_from_raw_parts)]
 /**
 ## Type safety
 Type safety is ensured by storing all used types in the database.
@@ -42,13 +42,6 @@ Root (shared)
 
 */
 
-extern crate memmap;
-extern crate alloc;
-extern crate core;
-extern crate parking_lot;
-extern crate libc;
-extern crate syscall_alt;
-extern crate istring;
 #[macro_use] extern crate tuple;
 
 #[macro_use]

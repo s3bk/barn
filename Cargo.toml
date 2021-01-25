@@ -1,17 +1,19 @@
 [package]
 name = "barn"
 version = "0.0.1"
-authors = ["Sebastian Köln <sebk@rynx.org>"]
-description = "Provides persistent space for Copy-On-Write structures and other animals."
+authors = ["Sebastian Köln <s3bk@protonmail.com>"]
+description = "Provides persistent space for Copy-On-Write structures."
 license = "MIT"
 repository = "https://github.com/s3bk/barn.git"
+edition = "2018"
 
 [dependencies]
-memmap = { git = "https://github.com/s3bk/memmap-rs.git" }
-istring = { git = "https://github.com/s3bk/istring.git" }
+memmap2 = "*"
+istring = "0.2.2"
 parking_lot = "*"
-syscall-alt = "*"
+syscalls = "*"
 tuple = "*"
+libc = "*"
 
 [dev-dependencies]
 simple-signal = "*"

@@ -19,11 +19,8 @@ pub fn syscall_result(ret: isize) -> Result<isize, isize> {
 pub mod futex {
     use std::sync::atomic::AtomicU32;
     use std::time::Duration;
-    use util::*;
-    use libc;
-    use syscall_alt::syscalls::Syscall;
-    use syscall_alt::constants::linux_like::SyscallResult::*;
-    use super::syscall_result;
+    use crate::util::*;
+    use syscalls::{syscall};
 
     #[derive(Debug)]
     pub enum FutexError {
@@ -41,7 +38,7 @@ pub mod futex {
         let timeout = timeout.map(timespec);
 
         let r = unsafe {
-            Syscall::futex.syscall6(
+            syscall!(SYS_futex,
                 atomic as *const AtomicU32 as isize, // int *uaddr
                 FutexOp::Wait as isize,              // int futex_op
                 val as isize,                        // int val
@@ -50,7 +47,7 @@ pub mod futex {
                 0                                    // int val3
             )
         };
-        match syscall_result(r) {
+        match r {
             Ok(_)      => Ok(()),
             Err(EAGAIN) => Ok(()),
             Err(e)     => Err(OsError(e as i32))
@@ -60,7 +57,7 @@ pub mod futex {
     #[inline]
     pub fn wake_n(atomic: &AtomicU32, n: i32) -> Result<(), FutexError> {
         let r = unsafe {
-            Syscall::futex.syscall6(
+            syscall!(SYS_futex,
                 atomic as *const AtomicU32 as isize, // int *uaddr
                 FutexOp::Wake as isize,              // int futex_op
                 n as isize,                          // int val
@@ -69,7 +66,7 @@ pub mod futex {
                 0                                    // int val3
             )
         };
-        match syscall_result(r) {
+        match r {
             Ok(_) => Ok(()),
             Err(e) => Err(OsError(e as i32))
         }

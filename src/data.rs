@@ -3,7 +3,7 @@
 store data aligned correctly
 
 */
-use memmap::{self, MmapMut, Protection};
+use memmap2::{self, MmapMut, MmapOptions};
 use std::{mem};
 use std::fs::{File, OpenOptions};
 use std::sync::Arc;
@@ -25,7 +25,7 @@ fn try_n<F, T, E>(n: usize, mut f: F) -> Result<T, E> where F: FnMut() -> Result
 
 pub struct BarnInner {
     size:   usize,
-    mmaps:  Vec<MmapMut>, // both mmap and
+    mmap:  MmapMut, // both mmap and
     file:   File  // file need to stay alive!
 }
 pub struct Barn {
@@ -33,36 +33,24 @@ pub struct Barn {
     inner:  Mutex<BarnInner>,
 }
 impl Barn {
-    pub fn load_file(file: File, create: bool) -> Arc<Barn> {
+    pub fn load_file(file: File, create: bool, min_size: usize) -> Arc<Barn> {
         assert!(size!(Arena) <= SUPER_BLOCK_SIZE);
     
-        let default_size = 128 * SUPER_BLOCK_SIZE;
-        let mut file_size = file.metadata().expect("can't read metadata").len() as usize;
+        let mut file_size = min_size.max(file.metadata().expect("can't read metadata").len() as usize);
         let mut needs_init = false;
         if file_size == 0 {
             assert_eq!(create, true);
             println!("initializing");
-            file.set_len(default_size as u64).expect("failed to resize file");
-            file_size = default_size;
+            file.set_len(min_size as u64).expect("failed to resize file");
+            file_size = min_size;
             needs_init = true;
         }
         let (mmap, arena) = {
-            let mut base = 0;
-            let mut mmap = try_n(10, || {
-                let mut cfg = unsafe { memmap::file(&file) };
-                cfg.len(file_size);
-                cfg.protection(Protection::ReadWrite);
-                cfg.addr(base as *mut u8);
-                let mmap = cfg.map_mut().expect("failed to mmap");
-                let p = mmap.as_ptr() as usize;
-                log!("requested: {:16x}, got: {:16x}", base, p);
-                if p % SUPER_BLOCK_SIZE == 0 {
-                    Ok(mmap)
-                } else {
-                    base = round_up(p, SUPER_BLOCK_SIZE);
-                    Err(())
-                }
-            }).expect("failed to open mmap");
+            let mut cfg = MmapOptions::new();
+            cfg.len(file_size);
+            let mmap = cfg.map_mut(&file).expect("failed to mmap");
+            let p = mmap.as_ptr() as usize;
+            assert!(p % SUPER_BLOCK_SIZE == 0);
             println!("mmap at {:p}", mmap.as_ptr());
 
             unsafe {
@@ -77,13 +65,13 @@ impl Barn {
                 (mem::transmute(mmap), arena)
             }
         };
-                
+        
         Arc::new(Barn {
             arena:  arena,
             inner:  Mutex::new(BarnInner{
                 file:   file,
                 size:   file_size,
-                mmaps:  vec![mmap]
+                mmap
             })
         })
     }
@@ -96,7 +84,7 @@ impl Barn {
         .open(path)
         .expect("faild to open file");
         
-        Barn::load_file(f, create)
+        Barn::load_file(f, create, 128 * SUPER_BLOCK_SIZE)
     }
     
     pub fn inner(&self) -> &Mutex<BarnInner> {
@@ -111,35 +99,6 @@ impl Barn {
         self.arena().root()
     }
 }
-impl Drop for Barn {
-    fn drop(&mut self) {
-        let mut inner = self.inner.lock();
-        for _ in inner.mmaps.drain(..) {
-        }
-    }
-}
-impl BarnInner {
-    pub fn grow(&mut self) -> (usize, usize) {
-        let base = self.mmaps.last().unwrap().as_ptr();
-        let additional = round_up(self.size / 4, SUPER_BLOCK_SIZE);
-        let old_size = self.size;
-        let new_size = self.size + additional;
-        let mut cfg = unsafe { memmap::file(&self.file) };
-        cfg.offset(self.size);
-        cfg.len(additional);
-        cfg.protection(Protection::ReadWrite);
-        cfg.addr(unsafe { base.offset(additional as isize) as *mut u8 });
-        let mmap = cfg.map_mut().expect("failed to grow");
-        let ptr = mmap.as_ptr() as usize;
-        assert_eq!(ptr as usize, base as usize + old_size);
-        println!("growing mmap at {:x}", ptr);
-        self.mmaps.push(mmap);
-        self.size = new_size;
-        
-        
-        (old_size, additional)
-    }
-}
 
 #[test]
 fn test_read() {
@@ -150,9 +109,11 @@ fn test_read() {
             Some(d) => println!("read 1: {:?}", d),
             None => println!("read 1: nothing")
         }
-        let heap = Heap::new(&b);
+        let heap = Heap::new(b);
         
-        let data = &heap <- [1, 2, 3, 4u8];
+        use crate::stash::Vec;
+        let mut v = Vec::with_capacity(&heap, 4);
+        v.extend_from_slice(&[1, 2, 3, 4u8]);
         println!("data: {:?}", data);
         
         root.swap(data.into_rc());

@@ -1,8 +1,10 @@
 pub use std::{ptr, mem};
-use alloc::raw_vec::RawVec;
 use istring::{self, IString};
-use arena::{Heap, Unique, Shared, Data};
+use crate::arena::{Heap, Unique, Shared, Data};
 use tuple;
+use std::mem::forget;
+use std::ptr::NonNull;
+use std::alloc::Layout;
 
 /// Marker trait for Position independend Data
 ///
@@ -38,60 +40,72 @@ impl<T: Relative> Packable for T {
 */
 /// Utility trait to transition between Relative and Absolute references
 pub unsafe trait Stash<'a>: Packable {
-    fn pack(self) -> Self::Packed;
+    fn pack(self, a: &'a Heap) -> Self::Packed;
     fn unpack(a: &'a Heap, p: Self::Packed) -> Self;
 }
 unsafe impl<'a, T> Stash<'a> for T where T: Relative + Packable<Packed=T> {
-    fn pack(self) -> Self::Packed { self }
+    fn pack(self, a: &'a Heap) -> Self::Packed { self }
     fn unpack(_: &'a Heap, p: Self::Packed) -> Self { p }
 }
 
 #[repr(C)]
-pub struct PackedRawVec<T: Relative> {
+pub struct PackedVec<T: Relative> {
     pos:   Unique<T>,
-    cap:   u32
-}
-unsafe impl<T: Relative> Relative for PackedRawVec<T> {}
-impl<'a, T: Relative> Packable for RawVec<T, &'a Heap> {
-    type Packed = PackedRawVec<T>;
-}
-unsafe impl<'a, T: Relative> Stash<'a> for RawVec<T, &'a Heap> {   
-    fn pack(self) -> Self::Packed {
-        let (ptr, cap, a) = self.into_raw_parts();
-        PackedRawVec {
-            pos: Unique::from_ptr(a.arena(), ptr),
-            cap: cap as u32
-        }
-    }
-    fn unpack(a: &'a Heap, p: Self::Packed) -> Self {
-        unsafe {
-            RawVec::from_raw_parts_in(p.pos.ptr(a.arena()), p.cap as usize, a)
-        }
-    }
+    cap:   u32,
+    len:   u32
 }
 
 #[repr(C)]
-pub struct PackedVec<T: Relative> {
-    raw: PackedRawVec<T>,
-    len: u32
+pub struct Vec<'a, T> {
+    heap: &'a Heap,
+    ptr: *mut T,
+    cap: usize,
+    len: usize,
 }
-unsafe impl<T: Relative> Relative for PackedVec<T> {}
-impl<'a, T: Relative> Packable for Vec<T, &'a Heap> {
-    type Packed = PackedVec<T>;
-}
-unsafe impl<'a, T: Relative> Stash<'a> for Vec<T, &'a Heap> {
-    fn pack(self) -> Self::Packed {
-        let (raw, len) = self.into_raw_vec_and_len();
-        PackedVec {
-            raw: raw.pack(),
-            len: len as u32
+impl<'a, T> Vec<'a, T> {
+    pub fn with_capacity(heap: &'a Heap, capacity: usize) -> Self {
+        assert!(capacity <= u32::max_value() as usize);
+        let ptr = heap.allocate(Layout::array::<T>(capacity).unwrap()).unwrap().cast();
+        Vec {
+            heap,
+            ptr,
+            cap: capacity,
+            len: 0
         }
     }
+}
+impl<'a, T: Copy> Vec<'a, T> {
+    pub fn extend_from_slice(&mut self, slice: &[T]) {
+        assert!(self.len + slice.len() <= self.cap);
+        std::ptr::copy_nonoverlapping(slice.as_ptr(), self.ptr.offset(self.len as isize), slice.len());
+        self.len += slice.len();
+    }
+}
+
+unsafe impl<T: Relative> Relative for PackedVec<T> {}
+impl<'a, T: Relative> Packable for Vec<'a, T> {
+    type Packed = PackedVec<T>;
+}
+unsafe impl<'a, T: Relative> Stash<'a> for Vec<'a, T> {
+    fn pack(self, a: &'a Heap) -> Self::Packed {
+        let packed = PackedVec {
+            pos: Unique::from_ptr(a.arena(), self.ptr),
+            len: self.len as u32,
+            cap: self.cap as u32,
+        };
+        forget(self);
+        packed
+    }
     
-    fn unpack(a: &'a Heap, p: Self::Packed) -> Self {
-        unsafe {
-            Vec::from_raw_vec_and_len(RawVec::unpack(a, p.raw), p.len as usize)
-        }
+    fn unpack(heap: &'a Heap, p: Self::Packed) -> Self {
+        let v = Vec {
+            heap,
+            ptr: p.pos.ptr(heap.arena()),
+            cap: p.cap as usize,
+            len: p.len as usize,
+        };
+        forget(p);
+        v
     }
 }
 
@@ -126,7 +140,7 @@ impl<'a> Packable for IString<&'a Heap> {
     type Packed = PackedString;
 }
 unsafe impl<'a> Stash<'a> for IString<&'a Heap> {
-    fn pack(mut self) -> Self::Packed {
+    fn pack(mut self, a: &Heap) -> Self::Packed {
         // there are 3 cases:
         // a) already on the heap -> keep it that way
         // b) inlined and fits in 11 bytes -> keep it inlined
@@ -162,7 +176,7 @@ unsafe impl<'a> Stash<'a> for IString<&'a Heap> {
         unsafe {
             if p.union.heap.len & (1 << 31) == 0 { // not inlined
                 let string_heap = istring::Heap {
-                    ptr: ptr::Unique::new(p.union.heap.pos.ptr(heap.arena())),
+                    ptr: NonNull::new(p.union.heap.pos.ptr(heap.arena())).unwrap(),
                     cap: p.union.heap.cap as usize,
                     len: p.union.heap.len as usize
                 };

@@ -1,15 +1,16 @@
 use std::{fmt, ptr, u32, cmp, mem};
-use alloc::allocator::{Alloc, Layout, AllocErr};
+use std::alloc::{AllocRef, Layout, AllocErr};
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::atomic::Ordering::*;
 use std::marker::PhantomData;
-use std::ops::{Place, Placer, InPlace, Deref, DerefMut};
+use std::ops::{Deref, DerefMut};
 use std::hash::{Hash, Hasher};
 use std::cmp::{PartialEq, Eq};
 use std::cell::Cell;
 use std::time::Duration;
 use std::clone::Clone;
-use core::nonzero::NonZero;
+use std::ptr::NonNull;
+use std::num::NonZeroU32;
 use super::*;
 use linux::*;
 use std::sync::Arc;
@@ -39,7 +40,7 @@ impl OffsetScale for SuperBlockScale {
 
 #[repr(C)]
 pub struct RelOffset<I, O, S: OffsetScale> {
-    pos:    NonZero<u32>,
+    pos:    NonZeroU32,
     _i:     PhantomData<I>,
     _o:     PhantomData<O>,
     _s:     PhantomData<S>
@@ -47,9 +48,8 @@ pub struct RelOffset<I, O, S: OffsetScale> {
 impl<I, O, S: OffsetScale> RelOffset<I, O, S> {
     #[inline(always)]
     fn new(off: u32) -> Self {
-        debug_assert!(off > 0);
         RelOffset {
-            pos:    unsafe { NonZero::new(off) },
+            pos:    NonZeroU32::new(off).unwrap(),
             _i:     PhantomData,
             _o:     PhantomData,
             _s:     PhantomData
@@ -60,8 +60,8 @@ impl<I, O, S: OffsetScale> RelOffset<I, O, S> {
         &*((base as *const I as usize + self.offset()) as *const O)
     }
     #[inline(always)]
-    fn get_shared(self, base: &I) -> ptr::Shared<O> {
-        unsafe { ptr::Shared::new(self.get(base) as *const O as *mut O) }
+    fn get_shared(self, base: &I) -> NonNull<O> {
+        unsafe { NonNull::new(self.get(base) as *const O as *mut O).unwrap() }
     }
     #[inline(always)]
     unsafe fn get_as_mut(self, base: &I) -> &mut O {
@@ -229,7 +229,7 @@ impl SuperBlock {
         
         self.free.init();
         for i in (first_chunk .. last_chunk).rev() {
-            self.free.push(self, RelOffset::new((i * chunk_size as u32)));
+            self.free.push(self, RelOffset::new(i * chunk_size as u32));
         }
         
         *self.used.get_mut() = 0;
@@ -515,7 +515,7 @@ impl Arena {
 
 pub struct Heap {
     barn:  Arc<Barn>,
-    classes: [Cell<Option<ptr::Shared<SuperBlock>>>; NUM_SIZE_CLASSES]
+    classes: [Cell<Option<NonNull<SuperBlock>>>; NUM_SIZE_CLASSES]
 }
 impl Heap {
     pub fn new(barn: Arc<Barn>) -> Heap {
@@ -529,7 +529,7 @@ impl Heap {
     pub fn arena(&self) -> &Arena {
         self.barn.arena()
     }
-    unsafe fn allocate(&self, layout: Layout) -> Result<*mut u8, AllocErr> {
+    pub unsafe fn allocate(&self, layout: Layout) -> Result<*mut u8, AllocErr> {
         log!("allocate({:?})", layout);
         let size = layout.size();
         if size == 0 {
@@ -554,11 +554,7 @@ impl Heap {
             // we need a new block.
             let off = match self.arena().get_block(class) {
                 Some(block) => block,
-                None => {
-                    let info = self.barn.inner().lock().grow();
-                    self.arena().add_memory(info);
-                    self.arena().get_block(class).expect("no fresh memory avaible")
-                }
+                None => panic!("OOM")
             };
             
             let block = off.get_shared(self.arena());
@@ -580,7 +576,8 @@ impl Heap {
         log!("deallocate_one({:p}) layout={:?}", ptr, layout);
         SuperBlock::free(ptr as *mut u8, layout)
     }
-    unsafe fn deallocate(&self, ptr: *mut u8, layout: Layout) {
+
+    pub unsafe fn deallocate(&self, ptr: *mut u8, layout: Layout) {
         log!("deallocate({:p}) layout={:?}", ptr, layout);
         SuperBlock::free(ptr, layout)
     }
@@ -592,51 +589,15 @@ impl Drop for Heap {
         }
     }
 }
-unsafe impl Alloc for Heap {
-    #[inline(always)]
-    unsafe fn alloc(&mut self, layout: Layout) -> Result<*mut u8, AllocErr> {
-        self.allocate(layout)
-    }
-    #[inline(always)]
-    unsafe fn dealloc(&mut self, ptr: *mut u8, layout: Layout) {
-        self.deallocate(ptr, layout)
-    }
-}
 
-unsafe impl<'a> Alloc for &'a Heap {
-    #[inline(always)]
-    unsafe fn alloc(&mut self, layout: Layout) -> Result<*mut u8, AllocErr> {
-        self.allocate(layout)
+unsafe impl<'a> AllocRef for &'a Heap {
+    fn alloc(&mut self, layout: Layout) -> Result<NonNull<[u8]>, AllocErr> {
+        unsafe {
+            self.allocate(layout: Layout).map(|ptr| NonNull::slice_from_raw_parts(NonNull::new_unchecked(ptr), layout.size()))
+        }
     }
-    #[inline(always)]
-    unsafe fn dealloc(&mut self, ptr: *mut u8, layout: Layout) {
-        self.deallocate(ptr, layout)
-    }
-}
-
-pub struct Hole<'a, T: 'a> {
-    inner:  *mut Data<T>,
-    arena:  &'a Arena
-}
-impl<'a, T: 'a> Placer<T> for &'a Heap {
-    type Place = Hole<'a, T>;
-    #[inline(always)]
-    fn make_place(mut self) -> Self::Place {
-        Hole { inner: self.alloc_one().unwrap().as_ptr(), arena: self.arena() }
-    }
-}
-impl<'a, T> Place<T> for Hole<'a, T> {
-    #[inline(always)]
-    fn pointer(&mut self) -> *mut T {
-        unsafe { &mut (*self.inner).data }
-    }
-}
-impl<'a, T> InPlace<T> for Hole<'a, T> {
-    type Owner = Box<'a, T>;
-    #[inline(always)]
-    unsafe fn finalize(self) -> Box<'a, T> {
-       *(*self.inner).rc.get_mut() = 0;
-        Box { inner: self.inner, arena: self.arena }
+    unsafe fn dealloc(&mut self, ptr: NonNull<u8>, layout: Layout) {
+        self.deallocate(ptr.as_ptr(), layout)
     }
 }
 
@@ -710,8 +671,8 @@ impl<T> Clone for Shared<T> {
 }
 impl<T> Copy for Shared<T> {}
 
-#[repr(C, packed)]
-pub struct Data<T> {
+#[repr(C)]
+pub struct Data<T: ?Sized> {
     rc:     AtomicU32,
     data:   T
 }
@@ -771,6 +732,9 @@ pub struct Rc<'a, T: 'a> {
     arena:  &'a Arena
 }
 impl<'a, T: 'a> Rc<'a, T> {
+    pub fn new(heap: &'a Heap, inner: T) -> Rc<'a, T> {
+        heap.allocate_one
+    }
     fn from_shared(arena: &Arena, pos: Shared<Data<T>>) -> Rc<T> {
         Rc {
             inner: pos.ptr(arena),
@@ -839,7 +803,7 @@ impl<'a, T: Relative + 'a> Packable for Box<'a, T> {
     type Packed = Unique<Data<T>>;
 }
 unsafe impl<'a, T: Relative + 'a> Stash<'a> for Box<'a, T> {
-    fn pack(self) -> Self::Packed {    
+    fn pack(self, heap: &'a Heap) -> Self::Packed {    
         let p = Unique::from_ptr(self.arena, self.inner);
         mem::forget(self);
         p
@@ -852,7 +816,7 @@ impl<'a, T: Relative + 'a> Packable for Rc<'a, T> {
      type Packed = Shared<Data<T>>;
 }
 unsafe impl<'a, T: Relative + 'a> Stash<'a> for Rc<'a, T> {   
-    fn pack(self) -> Self::Packed {
+    fn pack(self, heap: &'a Heap) -> Self::Packed {
         let p = Shared::from_ptr(self.arena, self.inner);
         mem::forget(self);
         p
