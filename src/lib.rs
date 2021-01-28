@@ -1,6 +1,5 @@
-#![feature(integer_atomics, allocator_api, i128_type, alloc, unique)]
-#![feature(placement_new_protocol, nonzero, placement_in_syntax, shared)]
-#![feature(libc, nonnull_slice_from_raw_parts)]
+#![feature(integer_atomics, allocator_api)]
+#![feature(libc, nonnull_slice_from_raw_parts, slice_ptr_get, slice_ptr_len)]
 /**
 ## Type safety
 Type safety is ensured by storing all used types in the database.

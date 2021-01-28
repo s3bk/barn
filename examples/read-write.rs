@@ -1,7 +1,5 @@
-#![feature(placement_in_syntax, box_syntax, core_intrinsics)]
+#![feature(box_syntax, core_intrinsics)]
 
-extern crate barn;
-extern crate simple_signal;
 use barn::*;
 
 fn main() {
@@ -28,7 +26,7 @@ fn main() {
         }
         let heap = Heap::new(b.clone());
         
-        let data = &heap <- [1, 2, 3, 4u8];
+        let data = Box::new(&heap, [1, 2, 3, 4u8]).unwrap();
         println!("data: {:?}", data);
         
         root.swap(data.into_rc());

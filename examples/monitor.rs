@@ -1,7 +1,5 @@
-#![feature(placement_in_syntax, box_syntax, core_intrinsics)]
+#![feature(box_syntax, core_intrinsics)]
 
-extern crate barn;
-extern crate simple_signal;
 use barn::*;
 
 fn main() {

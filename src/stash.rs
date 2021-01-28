@@ -5,6 +5,9 @@ use tuple;
 use std::mem::forget;
 use std::ptr::NonNull;
 use std::alloc::Layout;
+use std::fmt;
+use std::ops::Deref;
+use std::alloc::Allocator;
 
 /// Marker trait for Position independend Data
 ///
@@ -58,17 +61,18 @@ pub struct PackedVec<T: Relative> {
 #[repr(C)]
 pub struct Vec<'a, T> {
     heap: &'a Heap,
-    ptr: *mut T,
+    ptr: NonNull<T>,
     cap: usize,
     len: usize,
 }
 impl<'a, T> Vec<'a, T> {
     pub fn with_capacity(heap: &'a Heap, capacity: usize) -> Self {
         assert!(capacity <= u32::max_value() as usize);
-        let ptr = heap.allocate(Layout::array::<T>(capacity).unwrap()).unwrap().cast();
+        let ptr = heap.allocate(Layout::array::<T>(capacity).unwrap()).unwrap();
+        let cap = ptr.len() / std::mem::size_of::<T>();
         Vec {
             heap,
-            ptr,
+            ptr: ptr.cast(),
             cap: capacity,
             len: 0
         }
@@ -77,8 +81,30 @@ impl<'a, T> Vec<'a, T> {
 impl<'a, T: Copy> Vec<'a, T> {
     pub fn extend_from_slice(&mut self, slice: &[T]) {
         assert!(self.len + slice.len() <= self.cap);
-        std::ptr::copy_nonoverlapping(slice.as_ptr(), self.ptr.offset(self.len as isize), slice.len());
+        unsafe {
+            std::ptr::copy_nonoverlapping(slice.as_ptr(), (self.ptr.as_mut() as *mut T).offset(self.len as isize), slice.len());
+        }
         self.len += slice.len();
+    }
+}
+impl<'a, T> Deref for Vec<'a, T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        unsafe {
+            std::slice::from_raw_parts(self.ptr.as_ptr(), self.len)
+        }
+    }
+}
+impl<'a, T: fmt::Debug> fmt::Debug for Vec<'a, T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+impl<'a, T> Drop for Vec<'a, T> {
+    fn drop(&mut self) {
+        unsafe {
+            self.heap.deallocate(self.ptr.cast(), Layout::array::<T>(self.cap).unwrap());
+        }
     }
 }
 
@@ -163,7 +189,7 @@ unsafe impl<'a> Stash<'a> for IString<&'a Heap> {
         } else { // case 'a'
             let (data, heap) = self.to_heap();
             let packed_heap = PackedStringHeap {
-                pos: Unique::from_ptr(heap.arena(), data.ptr.as_ptr()),
+                pos: Unique::from_ptr(heap.arena(), data.ptr),
                 cap: data.cap as u32,
                 len: data.len as u32
             };
@@ -176,7 +202,7 @@ unsafe impl<'a> Stash<'a> for IString<&'a Heap> {
         unsafe {
             if p.union.heap.len & (1 << 31) == 0 { // not inlined
                 let string_heap = istring::Heap {
-                    ptr: NonNull::new(p.union.heap.pos.ptr(heap.arena())).unwrap(),
+                    ptr: p.union.heap.pos.ptr(heap.arena()),
                     cap: p.union.heap.cap as usize,
                     len: p.union.heap.len as usize
                 };
@@ -196,7 +222,7 @@ unsafe impl<'a> Stash<'a> for IString<&'a Heap> {
 }
 
 macro_rules! impl_stash {
-    ($($Tuple:ident { $($T:ident . $t:ident . $idx:tt),* } )*) => ($(
+    ($($Tuple:ident $_:ident { $($T:ident . $t:ident . $idx:tt),* } )*) => ($(
         #[repr(C, packed)]
         pub struct $Tuple<$($T: Relative),*>( $( pub $T ),* );
         unsafe impl<$($T: Relative),*> Relative for $Tuple<$($T),*> {}
@@ -204,9 +230,9 @@ macro_rules! impl_stash {
             type Packed = $Tuple<$($T::Packed),*>;
         }
         unsafe impl<'a $(,$T: Stash<'a>)*> Stash<'a> for tuple::$Tuple<$($T),*> {
-            fn pack(self) -> Self::Packed {
+            fn pack(self, heap: &'a Heap) -> Self::Packed {
                 let tuple::$Tuple($($t),*) = self;
-                $Tuple($($t.pack()),*)
+                $Tuple($($t.pack(heap)),*)
             }
             fn unpack(heap: &'a Heap, p: Self::Packed) -> Self {
                 let $Tuple($($t),*) = p;
@@ -217,9 +243,9 @@ macro_rules! impl_stash {
             type Packed = $Tuple<$($T::Packed),*>;
         }
         unsafe impl<'a $(,$T: Stash<'a>)*> Stash<'a> for ($($T,)*) {
-            fn pack(self) -> Self::Packed {
+            fn pack(self, heap: &'a Heap) -> Self::Packed {
                 let ($($t,)*) = self;
-                $Tuple($($t.pack()),*)
+                $Tuple($($t.pack(heap)),*)
             }
             fn unpack(heap: &'a Heap, p: Self::Packed) -> Self {
                 let $Tuple($($t),*) = p;

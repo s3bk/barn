@@ -1,5 +1,5 @@
 use std::{fmt, ptr, u32, cmp, mem};
-use std::alloc::{AllocRef, Layout, AllocErr};
+use std::alloc::{Allocator, Layout, AllocError};
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::atomic::Ordering::*;
 use std::marker::PhantomData;
@@ -14,6 +14,9 @@ use std::num::NonZeroU32;
 use super::*;
 use linux::*;
 use std::sync::Arc;
+
+pub type HeaderType = [u8; 4];
+pub const HEADER_MAGIC: HeaderType = *b"barn";
 
 pub trait OffsetScale {
     fn scale(n: u32) -> usize;
@@ -243,15 +246,6 @@ impl SuperBlock {
     }
     
     #[inline(always)]
-    pub fn free(ptr: *mut u8, _layout: Layout) {
-        let ptr = ptr as usize;
-        let pos = ptr & (SUPER_BLOCK_SIZE-1); // position within the block;
-        let block_ptr = (ptr & !(SUPER_BLOCK_SIZE-1)) as *const SuperBlock;
-        let block = unsafe { &*block_ptr };
-        block._free(pos as u32);
-    }
-    
-    #[inline(always)]
     fn _free(&self, pos: u32) {
         assert_eq!(pos % self.class.size() as u32, 0);
         self.free.push(self, RelOffset::new(pos));
@@ -358,7 +352,7 @@ fn test_size_classes() {
 // b) avoid allocating at the end of the file (and try to free the last block)
 #[repr(C)]
 pub struct Arena {
-    header:     [u8; 4],
+    header:     HeaderType,
     version:    u32,
     
     // free SuperBlocks (can be reused for any size class)
@@ -395,8 +389,8 @@ impl Arena {
         self.version = 1;
     }
 
-    fn check_header(&self) {
-        assert_eq!(self.header, *b"barn");
+    pub fn check_header(&self) {
+        assert_eq!(self.header, HEADER_MAGIC);
         assert_eq!(self.version, 1);
     }
     
@@ -511,7 +505,41 @@ impl Arena {
     pub fn ptr_for_pos<T>(&self, pos: u32) -> *const T {
         self.byte_offset(pos) as *const T
     }
+
+    unsafe fn deallocate(&self, mut ptr: NonNull<u8>, layout: Layout) {
+        let pos = ptr.as_ptr() as usize - self as *const Arena as usize;
+
+        log!("deallocate({:p}) layout={:?}", ptr, layout);
+
+        let block_pos = pos & (SUPER_BLOCK_SIZE-1); // position within the block;
+        let block_off = pos & !(SUPER_BLOCK_SIZE-1);
+        let block_ptr = &*((block_off + self as *const Arena as usize) as *const SuperBlock);
+        let block = unsafe { &*block_ptr };
+        block._free(block_pos as u32);
+    }
 }
+
+pub unsafe trait AllocExt: Allocator {
+    fn allocate_val<T>(&self, val: T) -> Result<NonNull<T>, AllocError> {
+        let mut ptr = self.allocate_one()?;
+        unsafe {
+            ptr::write(ptr.as_mut(), val);
+        }
+        Ok(ptr.cast())
+    }
+
+    fn allocate_one<T>(&self) -> Result<NonNull<T>, AllocError> {
+        let layout = Layout::new::<T>();
+        let slice = self.allocate(layout)?;
+        Ok(slice.as_non_null_ptr().cast())
+    }
+    unsafe fn deallocate_one<T>(&self, ptr: NonNull<T>) {
+        let layout = Layout::new::<T>();
+        log!("deallocate_one({:p}) layout={:?}", ptr, layout);
+        self.deallocate(ptr.cast(), layout)
+    }
+}
+unsafe impl<A: Allocator> AllocExt for A {}
 
 pub struct Heap {
     barn:  Arc<Barn>,
@@ -529,58 +557,6 @@ impl Heap {
     pub fn arena(&self) -> &Arena {
         self.barn.arena()
     }
-    pub unsafe fn allocate(&self, layout: Layout) -> Result<*mut u8, AllocErr> {
-        log!("allocate({:?})", layout);
-        let size = layout.size();
-        if size == 0 {
-            return Ok(layout.align() as *mut u8);
-        }
-        if size <= MAX_ALLOC_SIZE {
-            let class = SizeClass::from_layout(layout);
-            
-            // fast path
-            if let Some(block) = self.classes[class.idx()].get() {
-                let block = block.as_ref();
-                if let Some(ptr) = block.alloc() {
-                    log!("allocated {} bytes in block #{} at {:p}", size, block.num, ptr);
-                    return Ok(ptr);
-                } else {
-                    // return it
-                    self.arena().mark_unmanaged(block);
-                }
-            }
-            
-            // slow path
-            // we need a new block.
-            let off = match self.arena().get_block(class) {
-                Some(block) => block,
-                None => panic!("OOM")
-            };
-            
-            let block = off.get_shared(self.arena());
-            // the only possible race is another thread clearing this
-            self.classes[class.idx()].set(Some(block));
-
-            let block = block.as_ref();
-            // everything is in place now ...
-            let ptr = block.alloc().expect("newly obtained block nas no space");
-            log!("allocated {} bytes in block #{} at {:p}", size, block.num, ptr);
-            Ok(ptr)
-        } else {
-            unimplemented!()
-            //self.arena().alloc(layout)
-        }
-    }
-    pub unsafe fn deallocate_one<T>(ptr: *mut T) {
-        let layout = Layout::new::<T>();
-        log!("deallocate_one({:p}) layout={:?}", ptr, layout);
-        SuperBlock::free(ptr as *mut u8, layout)
-    }
-
-    pub unsafe fn deallocate(&self, ptr: *mut u8, layout: Layout) {
-        log!("deallocate({:p}) layout={:?}", ptr, layout);
-        SuperBlock::free(ptr, layout)
-    }
 }
 impl Drop for Heap {
     fn drop(&mut self) {
@@ -590,19 +566,68 @@ impl Drop for Heap {
     }
 }
 
-unsafe impl<'a> AllocRef for &'a Heap {
-    fn alloc(&mut self, layout: Layout) -> Result<NonNull<[u8]>, AllocErr> {
+unsafe impl Allocator for Heap {
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         unsafe {
-            self.allocate(layout: Layout).map(|ptr| NonNull::slice_from_raw_parts(NonNull::new_unchecked(ptr), layout.size()))
+            log!("allocate({:?})", layout);
+            let size = layout.size();
+            if size == 0 {
+                return Ok(NonNull::slice_from_raw_parts(
+                    NonNull::new_unchecked(layout.align() as *mut u8),
+                    0
+                ));
+            }
+            if size <= MAX_ALLOC_SIZE {
+                let class = SizeClass::from_layout(layout);
+                
+                // fast path
+                if let Some(block) = self.classes[class.idx()].get() {
+                    let block = block.as_ref();
+                    if let Some(ptr) = block.alloc() {
+                        log!("allocated {} bytes in block #{} at {:p}", size, block.num, ptr);
+                        return Ok(NonNull::slice_from_raw_parts(
+                            NonNull::new_unchecked(ptr),
+                            class.size()
+                        ));
+                    } else {
+                        // return it
+                        self.arena().mark_unmanaged(block);
+                    }
+                }
+                
+                // slow path
+                // we need a new block.
+                let off = match self.arena().get_block(class) {
+                    Some(block) => block,
+                    None => panic!("OOM")
+                };
+                
+                let block = off.get_shared(self.arena());
+                // the only possible race is another thread clearing this
+                self.classes[class.idx()].set(Some(block));
+
+                let block = block.as_ref();
+                // everything is in place now ...
+                let ptr = block.alloc().expect("newly obtained block nas no space");
+                log!("allocated {} bytes in block #{} at {:p}", size, block.num, ptr);
+
+                Ok(NonNull::slice_from_raw_parts(
+                    NonNull::new_unchecked(ptr),
+                    class.size()
+                ))
+            } else {
+                unimplemented!()
+                //self.arena().alloc(layout)
+            }
         }
     }
-    unsafe fn dealloc(&mut self, ptr: NonNull<u8>, layout: Layout) {
-        self.deallocate(ptr.as_ptr(), layout)
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        self.arena().deallocate(ptr, layout)
     }
 }
 
 #[derive(Copy, Clone)]
-#[repr(C, packed)]
+#[repr(C)]
 pub struct Unique<T> {
     off:    RelOffset<Arena, T, Unity>
 }
@@ -611,8 +636,8 @@ impl<T> Unique<T> {
     pub fn pos(&self) -> RelOffset<Arena, T, Unity> { self.off }
     
     #[inline(always)]
-    pub fn from_ptr(arena: &Arena, ptr: *mut T) -> Unique<T> {
-        Unique::from_pos(RelOffset::from_ptr(arena, ptr))
+    pub fn from_ptr(arena: &Arena, ptr: NonNull<T>) -> Unique<T> {
+        Unique::from_pos(RelOffset::from_ptr(arena, ptr.as_ptr()))
     }
     
     #[inline(always)]
@@ -621,8 +646,8 @@ impl<T> Unique<T> {
     }
     
     #[inline(always)]
-    pub fn ptr(self, arena: &Arena) -> *mut T {
-        unsafe { self.off.get_as_mut(arena) }
+    pub fn ptr(&self, arena: &Arena) -> NonNull<T> {
+        unsafe { NonNull::new(self.off.get_as_mut(arena)).unwrap() }
     }
 }
 impl<T> cmp::PartialEq for Unique<T> {
@@ -655,8 +680,10 @@ impl<T> Shared<T> {
         self.off.pos()
     }
     #[inline(always)]
-    pub fn ptr(self, arena: &Arena) -> *const T {
-        unsafe { self.off.get(arena) }
+    pub fn ptr(self, arena: &Arena) -> NonNull<T> {
+        unsafe {
+            NonNull::new(self.off.get(arena) as *const T as *mut T).unwrap()
+        }
     }
 }
 impl<T> cmp::PartialEq for Shared<T> {
@@ -678,19 +705,31 @@ pub struct Data<T: ?Sized> {
 }
 
 pub struct Box<'a, T: 'a> {
-    inner:  *mut Data<T>,
-    arena:  &'a Arena
+    inner:  NonNull<Data<T>>,
+    arena:  &'a Arena,
 }
 impl<'a, T: 'a> Box<'a, T> {
     fn inner(&self) -> &Data<T> {
-        unsafe { &(*self.inner) }
+        unsafe { self.inner.as_ref() }
+    }
+    pub fn new(heap: &'a Heap, inner: T) -> Result<Box<'a, T>, AllocError> {
+        let mut ptr = heap.allocate_val(Data {
+            data: inner,
+            rc: AtomicU32::new(1)
+        })?;
+        unsafe {
+            Ok(Box {
+                inner: ptr,
+                arena: heap.arena()
+            })
+        }
     }
     pub fn into_rc(self) -> Rc<'a, T> {
         // set refcount to one
         self.inner().rc.store(1, Release);
         let rc = Rc {
             inner:  self.inner,
-            arena:  self.arena
+            arena:  self.arena,
         };
         mem::forget(self);
         rc
@@ -699,7 +738,10 @@ impl<'a, T: 'a> Box<'a, T> {
 impl<'a, T: 'a> Drop for Box<'a, T> {
     #[inline(always)]
     fn drop(&mut self) {
-        unsafe { Heap::deallocate_one(self.inner) }
+        unsafe { 
+            let layout = Layout::new::<Data<T>>();
+            self.arena.deallocate(self.inner.cast(), layout);
+        }
     }
 }
 impl<'a, T> Deref for Box<'a, T> {
@@ -712,7 +754,7 @@ impl<'a, T> Deref for Box<'a, T> {
 impl<'a, T> DerefMut for Box<'a, T> {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut T {
-        unsafe { &mut (*self.inner).data }
+        unsafe { &mut self.inner.as_mut().data }
     }
 }
 impl<'a, T, U> PartialEq<U> for Box<'a, T> where T: PartialEq<U> {
@@ -728,26 +770,35 @@ impl<'a, T: fmt::Debug> fmt::Debug for Box<'a, T> {
 
 #[derive(Clone)]
 pub struct Rc<'a, T: 'a> {
-    inner: *const Data<T>,
-    arena:  &'a Arena
+    inner: NonNull<Data<T>>,
+    arena: &'a Arena
 }
 impl<'a, T: 'a> Rc<'a, T> {
-    pub fn new(heap: &'a Heap, inner: T) -> Rc<'a, T> {
-        heap.allocate_one
+    pub fn new(heap: &'a Heap, inner: T) -> Result<Rc<'a, T>, AllocError> {
+        let ptr = heap.allocate_val(Data {
+            data: inner,
+            rc: AtomicU32::new(1)
+        })?;
+        unsafe {
+            Ok(Rc {
+                inner: ptr,
+                arena: heap.arena()
+            })
+        }
     }
-    fn from_shared(arena: &Arena, pos: Shared<Data<T>>) -> Rc<T> {
+    fn from_shared(arena: &'a Arena, pos: Shared<Data<T>>) -> Rc<'a, T> {
         Rc {
             inner: pos.ptr(arena),
-            arena: arena
+            arena
         }
     }
     fn inner(&self) -> &Data<T> {
-        unsafe { &*self.inner }
+        unsafe { self.inner.as_ref() }
     }
     pub fn lock(self) -> Result<Box<'a, T>, Rc<'a, T>> {
         match self.inner().rc.compare_exchange(1, 0, Acquire, Relaxed) {
             Ok(0) => Ok(Box {
-                inner: self.inner as *mut Data<T>,
+                inner: self.inner,
                 arena: self.arena
             }),
             Err(_) => Err(self),
@@ -767,7 +818,7 @@ impl<'a, T: 'a> Rc<'a, T> {
         s
     }
     fn offset(&self) -> RelOffset<Arena, Data<T>, Unity> {
-        RelOffset::from_ptr(self.arena, self.inner)
+        RelOffset::from_ptr(self.arena, self.inner.as_ptr())
     }
 }
 impl<'a, T> Drop for Rc<'a, T> {
@@ -781,7 +832,8 @@ impl<'a, T> Drop for Rc<'a, T> {
         if refcount == 1 {
             log!("deallocating");
             unsafe {
-                Heap::deallocate_one(self.inner as *mut Data<T>);
+                let layout = Layout::new::<Data<T>>();
+                self.arena.deallocate(self.inner.cast(), layout);
             }
         }
     }
@@ -817,7 +869,7 @@ impl<'a, T: Relative + 'a> Packable for Rc<'a, T> {
 }
 unsafe impl<'a, T: Relative + 'a> Stash<'a> for Rc<'a, T> {   
     fn pack(self, heap: &'a Heap) -> Self::Packed {
-        let p = Shared::from_ptr(self.arena, self.inner);
+        let p = Shared::from_ptr(self.arena, self.inner.as_ptr());
         mem::forget(self);
         p
     }
@@ -895,15 +947,18 @@ pub struct RcDataCell<T> {
 
 pub struct WaitError;
 
+/// Reference counted cell
+/// 
+/// This uses an Arena reference instead of a Heap as it can only deallocate
 pub struct RcCell<'a, T: 'a> {
     inner:  &'a RcDataCell<T>,
     arena:  &'a Arena
 }
 impl<'a, T: 'a> RcCell<'a, T> {
-    pub fn from_raw(inner: &'a RcDataCell<T>, arena:  &'a Arena) -> RcCell<'a, T> {
+    pub fn from_raw(inner: &'a RcDataCell<T>, arena: &'a Arena) -> RcCell<'a, T> {
         RcCell {
-            inner: inner,
-            arena: arena
+            inner,
+            arena
         }
     }
 
